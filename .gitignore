@@ -1,0 +1,33 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# PyTorch model weights
+*.pt
+
+# Numpy data files
+*.npy
+
+# CSV or dataset artifacts (if auto-generated)
+*.csv
+
+# IDE and editor configs
+.vscode/
+.idea/
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# Personal notes or temp notebooks (optional)
+note.ipynb
+test_gemini.ipynb
+dummy_train.py
+dim_test.py
+
+# Logs or temp files
+*.log
+*.tmp

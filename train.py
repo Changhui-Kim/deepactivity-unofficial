@@ -1,3 +1,5 @@
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -57,17 +59,28 @@ def train_model(model,
         
         for batch in train_loader:
             # 입력 및 타겟 분리
-            input_ids = batch['input_ids'].to(device)           # [B, S]
-            attention_mask = batch['attention_mask'].to(device) # [B, S]
-            type_labels = batch['type_labels'].to(device)       # [B]
-            start_labels = batch['start_labels'].to(device)     # [B]
-            end_labels = batch['end_labels'].to(device)         # [B]
-            SLM_start = create_soft_label_matrix(start_labels)  # [B, C]
-            SLM_end = create_soft_label_matrix(end_labels)      # [B, C]
+            activity_chain = batch['activity_chain'].to(device)
+            target_features = batch['target_features'].to(device)
+            household_members = batch['household_members'].to(device)
+            household_mask = batch['household_mask'].to(device)
+
+            # Dummy target for teacher forcing
+            tgt_activity = torch.zeros((1, activity_chain.size(0), 3), dtype=torch.long, device=device)
+
+            # Extract labels
+            type_labels = activity_chain[:, -1, 0].long()
+            start_labels = activity_chain[:, -1, 1].long()
+            end_labels = activity_chain[:, -1, 2].long()
+
+            SLM_start = create_soft_label_matrix(start_labels)
+            SLM_end = create_soft_label_matrix(end_labels)
+
+            SLM_start = create_soft_label_matrix(start_labels)
+            SLM_end = create_soft_label_matrix(end_labels)
 
             optimizer.zero_grad()
             # 순전파
-            type_logits, start_logits, end_logits = model(input_ids, attention_mask)
+            type_logits, start_logits, end_logits = model(activity_chain, target_features, household_members, tgt_activity, household_mask)
             P_start = F.log_softmax(start_logits, dim=1)        # [B, C]
             P_end = F.log_softmax(end_logits, dim=1)            # [B, C]
 
@@ -84,7 +97,7 @@ def train_model(model,
             L_seq = torch.mean(torch.relu(start_preds.float() - end_preds.float()))
 
             # L_o: penalizes overlap between consecutive activities
-            if input_ids.size(0) > 1:
+            if activity_chain.size(0) > 1:
                 end_preds_prev = end_preds[:-1]
                 start_preds_curr = start_preds[1:]
                 L_o = torch.mean(torch.relu(end_preds_prev.float() - start_preds_curr.float()))
@@ -101,7 +114,7 @@ def train_model(model,
             loss.backward()
             optimizer.step()
 
-            running_loss += loss.item() * input_ids.size(0)
+            running_loss += loss.item() * activity_chain.size(0)
 
         epoch_train_loss = running_loss / len(train_loader.dataset)
         scheduler.step()
@@ -111,15 +124,18 @@ def train_model(model,
         val_running_loss = 0.0
         with torch.no_grad():
             for batch in val_loader:
-                input_ids = batch['input_ids'].to(device)
-                attention_mask = batch['attention_mask'].to(device)
-                type_labels = batch['type_labels'].to(device)
-                start_labels = batch['start_labels'].to(device)
-                end_labels = batch['end_labels'].to(device)
+                activity_chain = batch['activity_chain'].to(device)
+                target_features = batch['target_features'].to(device)
+                household_members = batch['household_members'].to(device)
+                household_mask = batch['household_mask'].to(device)
+
+                # Dummy target for teacher forcing
+                tgt_activity = torch.zeros((1, activity_chain.size(0), 3), dtype=torch.long, device=device)
+
                 SLM_start = create_soft_label_matrix(start_labels)
                 SLM_end = create_soft_label_matrix(end_labels)
 
-                type_logits, start_logits, end_logits = model(input_ids, attention_mask)
+                type_logits, start_logits, end_logits = model(activity_chain, target_features, household_members, tgt_activity, household_mask)
                 P_start = F.log_softmax(start_logits, dim=1)
                 P_end = F.log_softmax(end_logits, dim=1)
 
@@ -135,7 +151,7 @@ def train_model(model,
                 L_seq = torch.mean(torch.relu(start_preds.float() - end_preds.float()))
 
                 # L_o: penalizes overlap between consecutive activities
-                if input_ids.size(0) > 1:
+                if activity_chain.size(0) > 1:
                     end_preds_prev = end_preds[:-1]
                     start_preds_curr = start_preds[1:]
                     L_o = torch.mean(torch.relu(end_preds_prev.float() - start_preds_curr.float()))
@@ -147,7 +163,7 @@ def train_model(model,
                         loss_weights['L_e'] * L_e +
                         loss_weights['L_o'] * L_o +
                         loss_weights['L_seq'] * L_seq)
-                val_running_loss += loss.item() * input_ids.size(0)
+                val_running_loss += loss.item() * activity_chain.size(0)
 
         epoch_val_loss = val_running_loss / len(val_loader.dataset)
 
@@ -178,14 +194,23 @@ if __name__ == "__main__":
     CHAIN_PATH = "C:/Users/user/PTV_Intern/src/DeepAM/dataset/activity_chain.npy"
     IDS_PATH = "C:/Users/user/PTV_Intern/src/DeepAM/dataset/person_ids.csv"
     W_PATH = "C:/Users/user/PTV_Intern/src/DeepAM/dataset/chain_weights.npy"
-    
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    # model = FullActivityTransformer(...).to(device) # Replace with your model initialization
-    # train_dataset = ActivityDataset(split='train')
-    # val_dataset = ActivityDataset(split='val')
-    # sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
-    # train_loader = DataLoader(datset, batch_size=64, sampler=sampler)
-    # val_loader = DataLoader(val_dataset, batch_size=32)
+
+
+    
+
+    
+    activity_chains = np.load(CHAIN_PATH)
+    all_person_df = pd.read_csv(PERSONS_PATH)
+    person_ids_df = pd.read_csv(IDS_PATH)
+    train_dataset = ActivityDataset(activity_chains, all_person_df, person_ids_df)
+    
+    
+    weights = np.load(W_PATH)
+    sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+    train_loader = DataLoader(train_dataset, batch_size=64, sampler=sampler)
+    
 
     # Define loss weights
     loss_weights = {
@@ -196,10 +221,4 @@ if __name__ == "__main__":
         'L_seq': 0.5
     }
 
-    # trained_model = train_model(model,
-    #                             train_loader,
-    #                             val_loader,
-    #                             device,
-    #                             num_epochs=30,
-    #                             lr=5e-5,
-    #                             loss_weights=loss_weights)
+    

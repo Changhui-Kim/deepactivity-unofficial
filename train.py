@@ -43,7 +43,7 @@ def train_model(model,
         loss_weights = {'L_CE': 1.0, 'L_s': 1.0, 'L_e': 1.0, 'L_o': 1.0, 'L_seq': 1.0}
 
     # 손실 함수 정의
-    type_criterion = nn.CrossEntropyLoss()
+    type_criterion = nn.CrossEntropyLoss(reduction='none')
 
     # Optimizer & Scheduler
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -77,31 +77,45 @@ def train_model(model,
             type_logits, start_logits, end_logits = model(activity_chain, target_features, household_members, tgt_activity, household_mask)
             
             T, B, C_type = type_logits.shape
+            C_time = start_logits.shape[-1]
+
+            # Masking
+            tgt_len = activity_chain[:, 0, 3].long()
+            T_max = activity_chain.size(1)
+
+            idx = torch.arange(T_max - 1, device=device).unsqueeze(0)
+            tgt_mask = idx < tgt_len
+
+            mask_flat = tgt_mask.transpose(0, 1).reshape(-1).float()
 
             # 1) CrossEntropy for Activity Type
-            type_logits_flat  = type_logits.view(T * B, C_type)
+            type_logits_flat  = type_logits.view(-1, C_type)
             type_targets_flat = type_labels_seq[:, 1:].reshape(-1)  # 디코더 예측 스텝에 맞춰 시프트
-            L_CE = type_criterion(type_logits_flat, type_targets_flat)
+            ce_losses = type_criterion(type_logits_flat, type_targets_flat, reductino='none')
 
             # 2) Soft-label Losses for Start/End
-            P_start = F.log_softmax(start_logits.view(T * B, -1), dim=1)
-            P_end = F.log_softmax(end_logits.view(T * B, -1), dim=1)
+            P_start = F.log_softmax(start_logits.view(-1, C_time), dim=1)
+            P_end = F.log_softmax(end_logits.view(-1, C_time), dim=1)
 
             SLM_start = create_soft_label_matrix(start_labels_seq[:, 1:].reshape(-1))
             SLM_end = create_soft_label_matrix(end_labels_seq[:, 1:].reshape(-1))
 
-            L_s = -(SLM_start * P_start).sum(dim=1).mean()
-            L_e = -(SLM_end * P_end).sum(dim=1).mean()
+            soft_losses_start = -(SLM_start * P_start).sum(dim=1)   # [(T-1)*B]
+            soft_losses_end = -(SLM_end * P_end).sum(dim=1)
 
             # 3) Temporal Order & Overlap Penalties
             preds_start = start_logits.argmax(dim=2)    # [T-1, B]
             preds_end   = end_logits.argmax(dim=2)
 
             # L_seq: penalizes start_time > end_time
-            L_seq = torch.relu(preds_start.float() - preds_end.float()).mean()
+            L_seq = torch.relu(preds_start.float() - preds_end.float()).masked_select(tgt_mask).mean()
 
             # L_o: penalizes overlap between consecutive activities
-            L_o = torch.relu(preds_end[:-1,:,:].float() - preds_start[1:,:,:].float()).mean()
+            L_o = torch.relu(preds_end[:-1,:,:].float() - preds_start[1:,:,:].float()).masked_select(tgt_mask[:-1]).mean()
+            
+            L_CE    = (ce_losses            * mask_flat).sum() / mask_flat.sum()
+            L_s     = (soft_losses_start    * mask_flat).sum() / mask_flat.sum()
+            L_e     = (soft_losses_end      * mask_flat).sum() / mask_flat.sum()
 
             loss = (loss_weights['L_CE'] * L_CE +
                     loss_weights['L_s'] * L_s +

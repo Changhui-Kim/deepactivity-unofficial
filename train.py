@@ -46,7 +46,7 @@ def train_model(model,
     type_criterion = nn.CrossEntropyLoss()
 
     # Optimizer & Scheduler
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=scheduler_step, gamma=scheduler_gamma)
 
     # Early stopping 변수
@@ -64,45 +64,44 @@ def train_model(model,
             household_members = batch['household_members'].to(device)
             household_mask = batch['household_mask'].to(device)
 
-            # Dummy target for teacher forcing
-            tgt_activity = torch.zeros((1, activity_chain.size(0), 3), dtype=torch.long, device=device)
-
             # Extract labels
-            type_labels = activity_chain[:, -1, 0].long()
-            start_labels = activity_chain[:, -1, 1].long()
-            end_labels = activity_chain[:, -1, 2].long()
+            type_labels_seq = activity_chain[:, :, 0].long()
+            start_labels_seq = activity_chain[:, :, 1].long()
+            end_labels_seq = activity_chain[:, :, 2].long()
 
-            SLM_start = create_soft_label_matrix(start_labels)
-            SLM_end = create_soft_label_matrix(end_labels)
+            # Teacher Forcing Input
+            tgt_activity = activity_chain[:, :-1, :].permute(1, 0, 2).long().to(device)
 
-            SLM_start = create_soft_label_matrix(start_labels)
-            SLM_end = create_soft_label_matrix(end_labels)
-
-            optimizer.zero_grad()
             # 순전파
+            optimizer.zero_grad()
             type_logits, start_logits, end_logits = model(activity_chain, target_features, household_members, tgt_activity, household_mask)
-            P_start = F.log_softmax(start_logits, dim=1)        # [B, C]
-            P_end = F.log_softmax(end_logits, dim=1)            # [B, C]
+            
+            T, B, C_type = type_logits.shape
 
-            # 손실 계산
-            L_CE = type_criterion(type_logits, type_labels)
+            # 1) CrossEntropy for Activity Type
+            type_logits_flat  = type_logits.view(T * B, C_type)
+            type_targets_flat = type_labels_seq[:, 1:].reshape(-1)  # 디코더 예측 스텝에 맞춰 시프트
+            L_CE = type_criterion(type_logits_flat, type_targets_flat)
+
+            # 2) Soft-label Losses for Start/End
+            P_start = F.log_softmax(start_logits.view(T * B, -1), dim=1)
+            P_end = F.log_softmax(end_logits.view(T * B, -1), dim=1)
+
+            SLM_start = create_soft_label_matrix(start_labels_seq[:, 1:].reshape(-1))
+            SLM_end = create_soft_label_matrix(end_labels_seq[:, 1:].reshape(-1))
+
             L_s = -(SLM_start * P_start).sum(dim=1).mean()
             L_e = -(SLM_end * P_end).sum(dim=1).mean()
-            
-            # Get predicted indices for start and end times
-            _, start_preds = torch.max(start_logits, 1)
-            _, end_preds = torch.max(end_logits, 1)
+
+            # 3) Temporal Order & Overlap Penalties
+            preds_start = start_logits.argmax(dim=2)    # [T-1, B]
+            preds_end   = end_logits.argmax(dim=2)
 
             # L_seq: penalizes start_time > end_time
-            L_seq = torch.mean(torch.relu(start_preds.float() - end_preds.float()))
+            L_seq = torch.relu(preds_start.float() - preds_end.float()).mean()
 
             # L_o: penalizes overlap between consecutive activities
-            if activity_chain.size(0) > 1:
-                end_preds_prev = end_preds[:-1]
-                start_preds_curr = start_preds[1:]
-                L_o = torch.mean(torch.relu(end_preds_prev.float() - start_preds_curr.float()))
-            else:
-                L_o = 0.0
+            L_o = torch.relu(preds_end[:-1,:,:].float() - preds_start[1:,:,:].float()).mean()
 
             loss = (loss_weights['L_CE'] * L_CE +
                     loss_weights['L_s'] * L_s +
@@ -129,40 +128,49 @@ def train_model(model,
                 household_members = batch['household_members'].to(device)
                 household_mask = batch['household_mask'].to(device)
 
-                # Dummy target for teacher forcing
-                tgt_activity = torch.zeros((1, activity_chain.size(0), 3), dtype=torch.long, device=device)
+                # Extract labels
+                type_labels_seq = activity_chain[:, :, 0].long()
+                start_labels_seq = activity_chain[:, :, 1].long()
+                end_labels_seq = activity_chain[:, :, 2].long()
 
-                SLM_start = create_soft_label_matrix(start_labels)
-                SLM_end = create_soft_label_matrix(end_labels)
+                # Teacher Forcing Input
+                tgt_activity = activity_chain[:, :-1, :].permute(1, 0, 2).long().to(device)
 
                 type_logits, start_logits, end_logits = model(activity_chain, target_features, household_members, tgt_activity, household_mask)
-                P_start = F.log_softmax(start_logits, dim=1)
-                P_end = F.log_softmax(end_logits, dim=1)
+                
+                T, B, C_type = type_logits.shape
 
-                L_CE = type_criterion(type_logits, type_labels)
+                # 1) CrossEntropy for Activity Type
+                type_logits_flat  = type_logits.view(T * B, C_type)
+                type_targets_flat = type_labels_seq[:, 1:].reshape(-1)  # 디코더 예측 스텝에 맞춰 시프트
+                L_CE = type_criterion(type_logits_flat, type_targets_flat)
+
+                # 2) Soft-label Losses for Start/End
+                P_start = F.log_softmax(start_logits.view(T * B, -1), dim=1)
+                P_end = F.log_softmax(end_logits.view(T * B, -1), dim=1)
+
+                SLM_start = create_soft_label_matrix(start_labels_seq[:, 1:].reshape(-1))
+                SLM_end = create_soft_label_matrix(end_labels_seq[:, 1:].reshape(-1))
+                
                 L_s = -(SLM_start * P_start).sum(dim=1).mean()
                 L_e = -(SLM_end * P_end).sum(dim=1).mean()
                 
-                # Get predicted indices for start and end times
-                _, start_preds = torch.max(start_logits, 1)
-                _, end_preds = torch.max(end_logits, 1)
+                # 3) Temporal Order & Overlap Penalties
+                preds_start = start_logits.argmax(dim=2)    # [T-1, B]
+                preds_end   = end_logits.argmax(dim=2)
 
                 # L_seq: penalizes start_time > end_time
-                L_seq = torch.mean(torch.relu(start_preds.float() - end_preds.float()))
+                L_seq = torch.relu(preds_start.float() - preds_end.float()).mean()
 
                 # L_o: penalizes overlap between consecutive activities
-                if activity_chain.size(0) > 1:
-                    end_preds_prev = end_preds[:-1]
-                    start_preds_curr = start_preds[1:]
-                    L_o = torch.mean(torch.relu(end_preds_prev.float() - start_preds_curr.float()))
-                else:
-                    L_o = 0.0
+                L_o = torch.relu(preds_end[:-1,:,:].float() - preds_start[1:,:,:].float()).mean()
                 
                 loss = (loss_weights['L_CE'] * L_CE +
                         loss_weights['L_s'] * L_s +
                         loss_weights['L_e'] * L_e +
                         loss_weights['L_o'] * L_o +
                         loss_weights['L_seq'] * L_seq)
+                
                 val_running_loss += loss.item() * activity_chain.size(0)
 
         epoch_val_loss = val_running_loss / len(val_loader.dataset)

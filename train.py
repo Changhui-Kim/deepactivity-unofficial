@@ -174,12 +174,17 @@ if __name__ == "__main__":
     # 예시: 데이터 로더, 모델, 디바이스 설정 후 학습 호출
     from DeepAM.model.model import FullActivityTransformer
     from dataset.dataset import ActivityDataset
-
+    PERSONS_PATH = "C:/Users/user/PTV_Intern/src/DeepAM/dataset/persons_info.csv"
+    CHAIN_PATH = "C:/Users/user/PTV_Intern/src/DeepAM/dataset/activity_chain.npy"
+    IDS_PATH = "C:/Users/user/PTV_Intern/src/DeepAM/dataset/person_ids.csv"
+    W_PATH = "C:/Users/user/PTV_Intern/src/DeepAM/dataset/chain_weights.npy"
+    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # model = FullActivityTransformer(...).to(device) # Replace with your model initialization
     # train_dataset = ActivityDataset(split='train')
     # val_dataset = ActivityDataset(split='val')
-    # train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    # sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+    # train_loader = DataLoader(datset, batch_size=64, sampler=sampler)
     # val_loader = DataLoader(val_dataset, batch_size=32)
 
     # Define loss weights

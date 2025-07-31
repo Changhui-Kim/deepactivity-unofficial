@@ -241,9 +241,9 @@ class FullActivityTransformer(nn.Module):
         Args:
             src_activity (torch.Tensor): Source activity chain. Shape (t, n, 5).
             person_info (torch.Tensor): Target person info. Shape (1, n, 26).
-            household_info (torch.Tensor): Household members info. Shape (h, n, 9).
+            household_info (torch.Tensor): Household members info. Shape (4, n, 9).
             tgt_activity (torch.Tensor): Target activity sequence for the decoder. Shape (tgt_len, n, 3).
-            household_padding_mask (torch.Tensor, optional): Padding mask for household members. Shape (n, h).
+            household_padding_mask (torch.Tensor, optional): Padding mask for household members. Shape (n, 4).
         Returns:
             tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Logits for Type, StartTime, and EndTime predictions.
         """

@@ -8,7 +8,7 @@ class ActivityDataset(Dataset):
     def __init__(self, activity_chains, all_person_df, person_ids_df):
         """
         Args:
-            activity_chains (np.ndarray): Numpy array of shape [N, 10, 5] ([N, time, feature]).
+            activity_chains (np.ndarray): Numpy array of shape [N, 15, 5] ([N, time, feature]).
             all_person_df (pd.DataFrame): DataFrame with all person data from the survey.
             person_ids_df (pd.DataFrame): DataFrame from person_ids.csv, mapping chain index to HOUSEID/PERSONID.
         """
@@ -58,17 +58,28 @@ class ActivityDataset(Dataset):
                     continue
                 try:
                     member_row = self.all_person_df.loc[(houseid, member_personid)]
-                    partial_feat = member_row[self.hh_members_features].values
-                    members.append(torch.tensor(partial_feat, dtype=torch.float))
+                    feat = torch.tensor(member_row[self.hh_members_features].values, dtype=torch.float)
+                    members.append(feat)
                 except KeyError:
                     # This member is in the household but not in the main dataframe, which is strange
                     # but we can skip them.
                     pass
 
-        sample = {
-            'activity_chain': chain,
-            'target_features': target_features,
-            'household_members': members,
-            'label': chain[0, 0].long()
+        max_members = 4
+        num_members = len(members)
+        if num_members < max_members:
+            pad_tensor = torch.zeros((max_members - num_members, len(self.hh_members_features)), dtype=torch.float)
+            members = members + [pad_tensor[i] for i in range(pad_tensor.shape[0])]
+        elif num_members > max_members:
+            # Already preprocessed.. but just in case
+            members = members[:max_members]
+        members_tensor = torch.stack(members)
+        members_mask = torch.tensor([1]*min(num_members, max_members) + [0]*(max_members-num_members), dtype=torch.bool)
+        
+
+        return {
+            'activity_chain': chain,                # [15, 5]
+            'target_features': target_features,     # [23]
+            'household_members': members_tensor,    # [4, 9]
+            'household_mask': members_mask,         # [4]
         }
-        return sample

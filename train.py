@@ -190,10 +190,10 @@ def train_model(model,
                 preds_end   = end_logits.argmax(dim=2)
 
                 # L_seq: penalizes start_time > end_time
-                L_seq = torch.relu(preds_start.float() - preds_end.float()).masked_select(tgt_mask).mean()
+                L_seq = torch.relu(preds_start.float() - preds_end.float()).masked_select(tgt_mask).sum() / (tgt_mask.sum() + 1e-9)
 
                 # L_o: penalizes overlap between consecutive activities
-                L_o = torch.relu(preds_end[:-1,:,:].float() - preds_start[1:,:,:].float()).masked_select(tgt_mask[:-1]).mean()
+                L_o = torch.relu(preds_end[:-1,:,:].float() - preds_start[1:,:,:].float()).masked_select(tgt_mask[:-1]).sum() / (tgt_mask[:-1].sum() + 1e-9)
                 
                 L_CE    = (ce_losses            * mask_flat).sum() / mask_flat.sum()
                 L_s     = (soft_losses_start    * mask_flat).sum() / mask_flat.sum()
@@ -227,7 +227,7 @@ def train_model(model,
     model.load_state_dict(torch.load('best_model.pt'))
     return model
 
-def predict_sequence(model, src_activity, person_info, household_info, household_padding_mask, device, max_len=15):
+def predict_sequence(model, src_activity, person_info, household_info, household_padding_mask, device, max_len=16):
     """
     Performs autoregressive inference to generate an activity chain.
     Args:
@@ -326,7 +326,7 @@ if __name__ == "__main__":
     for col in full_dataset.hh_members_features:
         HOUSEHOLD_VOACB.append(len(all_person_df[col].unique()))
 
-    ACTIVITY_CHAIN_VOCAB = [] # [type=15+1, start=96, end=96, len=14, duration=96]
+    ACTIVITY_CHAIN_VOCAB = [] # [type=15+2, start=96, end=96, len=14, duration=96]
     for i in range(activity_chains.shape[-1]):
         ACTIVITY_CHAIN_VOCAB.append(activity_chains[:,:,i].max()+1)
 

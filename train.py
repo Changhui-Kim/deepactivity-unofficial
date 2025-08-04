@@ -81,7 +81,7 @@ def train_model(model,
             C_time = start_logits.shape[-1]
 
             # Masking
-            tgt_len = activity_chain[:, 0, 3].long()
+            tgt_len = activity_chain[:, 0, 3].long() + 1
             T_max = activity_chain.size(1)
 
             idx = torch.arange(T_max - 1, device=device).unsqueeze(0)
@@ -228,7 +228,7 @@ def train_model(model,
 
 if __name__ == "__main__":
     # 예시: 데이터 로더, 모델, 디바이스 설정 후 학습 호출
-    from DeepAM.model.model import FullActivityTransformer
+    from model.model import FullActivityTransformer
     from dataset.dataset import ActivityDataset
     from torch.utils.data import DataLoader, Dataset, Subset, WeightedRandomSampler
     from sklearn.model_selection import train_test_split
@@ -238,30 +238,27 @@ if __name__ == "__main__":
     W_PATH = "C:/Users/user/PTV_Intern/src/DeepAM/dataset/chain_weights.npy"
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = FullActivityTransformer(h2=4,
-                                    nhead=3,
-                                    enc_layers=4,
-                                    dec_layers=4,
-                                    d_hid = 2,
-                                    src_act_vocab=[],
-                                    src_act_embed=10,
-                                    person_vocab=[],
-                                    person_embed=1,
-                                    household_vocab=[],
-                                    household_embed=1,
-                                    tgt_act_vocab=[],
-                                    tgt_act_embed=1,
-                                    dropout=0.1
-
-    )
-
-    
-
     
     activity_chains = np.load(CHAIN_PATH)
-    all_person_df = pd.read_csv(PERSONS_PATH)
-    person_ids_df = pd.read_csv(IDS_PATH)
+    all_person_df = pd.read_csv(PERSONS_PATH, index_col=0)
+    person_ids_df = pd.read_csv(IDS_PATH, index_col=0)
     full_dataset = ActivityDataset(activity_chains, all_person_df, person_ids_df)
+    
+    # Get vocab size of target person info
+    PERSON_VOCAB = []
+    for col in all_person_df.columns:
+        if col not in ['HOUSEID', 'PERSONID']:
+            PERSON_VOCAB.append(len(all_person_df[col].unique()))
+
+    # Get vocab size of household member info
+    HOUSEHOLD_VOACB = []
+    for col in full_dataset.hh_members_features:
+        HOUSEHOLD_VOACB.append(len(all_person_df[col].unique()))
+
+    ACTIVITY_CHAIN_VOCAB = [] # [type, start=96, end=96, len=15, duration=96]
+    for i in range(activity_chains.shape[-1]):
+        ACTIVITY_CHAIN_VOCAB.append(activity_chains[:,:,i].max()+1)
+
     total_size = len(full_dataset)
     indices = np.arange(total_size)
     train_idx, temp_idx = train_test_split(indices, test_size=0.2, random_state=42)
@@ -277,6 +274,21 @@ if __name__ == "__main__":
     val_loader = DataLoader(val_set, batch_size=64, shuffle=False)
     test_loader = DataLoader(test_set, batch_size=64, shuffle=False)
     
+    model = FullActivityTransformer(h2=4,
+                                nhead=3,
+                                enc_layers=4,
+                                dec_layers=4,
+                                d_hid = 2,
+                                src_act_vocab=ACTIVITY_CHAIN_VOCAB,
+                                src_act_embed=10,
+                                person_vocab=PERSON_VOCAB,
+                                person_embed=1,
+                                household_vocab=HOUSEHOLD_VOACB,
+                                household_embed=1,
+                                tgt_act_vocab=ACTIVITY_CHAIN_VOCAB,
+                                tgt_act_embed=1,
+                                dropout=0.1
+    )
 
     # Define loss weights
     loss_weights = {

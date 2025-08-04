@@ -255,9 +255,9 @@ if __name__ == "__main__":
     for col in full_dataset.hh_members_features:
         HOUSEHOLD_VOACB.append(len(all_person_df[col].unique()))
 
-    ACTIVITY_CHAIN_VOCAB = [] # [type, start=96, end=96, len=15, duration=96]
+    ACTIVITY_CHAIN_VOCAB = [] # [type=15+1, start=96, end=96, len=14, duration=96]
     for i in range(activity_chains.shape[-1]):
-        ACTIVITY_CHAIN_VOCAB.append(activity_chains[:,:,i].max()+1)
+        ACTIVITY_CHAIN_VOCAB.append(activity_chains[:,:,i].max())
 
     total_size = len(full_dataset)
     indices = np.arange(total_size)

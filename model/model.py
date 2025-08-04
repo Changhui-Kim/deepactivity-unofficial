@@ -125,7 +125,7 @@ class ActivityTransformerEncoder(nn.Module):
         self.pos_encoder = PositionalEncoding(h2, dropout)
         encoder_layers = nn.TransformerEncoderLayer(d_model=h2, nhead=nhead, dim_feedforward=d_hid, dropout=dropout, batch_first=False)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=nlayers)
-        self.fixed_seq_len = 10
+        self.fixed_seq_len = 10         # 10 = P0,...,P4 + <S> * 5
 
     def _generate_causal_mask(self, sz: int, activity_start_idx: int) -> torch.Tensor:
         mask = torch.zeros((sz, sz), dtype=torch.bool)

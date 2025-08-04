@@ -18,7 +18,7 @@ class MultiFeatureEmbedding(nn.Module):
         super().__init__()
         if not isinstance(vocab_sizes, list) or len(vocab_sizes) != num_features:
             raise ValueError(f"vocab_sizes must be a list of integers of length {num_features}.")
-        self.embedders = nn.ModuleList([nn.Embedding(v_size, embed_dim) for v_size in vocab_sizes])
+        self.embedders = nn.ModuleList([nn.Embedding(v_size, embed_dim, padding_idx=0) for v_size in vocab_sizes])
         self.linear_proj = nn.Linear(num_features * embed_dim, output_dim)
         self.num_features = num_features
 
@@ -42,22 +42,23 @@ class CombinedInputEmbedding(nn.Module):
     """
     def __init__(self, h2: int, act_vocab_sizes: list[int], act_embed_dim: int,
                  person_vocab_sizes: list[int], person_embed_dim: int,
-                 household_vocab_sizes: list[int], household_embed_dim: int):
+                 household_vocab_sizes: list[int], household_embed_dim: int, num_features_list: list[int]):
         """
         Args:
             h2 (int): The final embedding dimension for all parts (d_model).
             act_vocab_sizes (list[int]): Vocab sizes for the 5 activity chain features.
             act_embed_dim (int): Embedding dimension for each activity feature.
-            person_vocab_sizes (list[int]): Vocab sizes for the 26 target person features.
+            person_vocab_sizes (list[int]): Vocab sizes for the 23 target person features.
             person_embed_dim (int): Embedding dimension for each person feature.
             household_vocab_sizes (list[int]): Vocab sizes for the 9 household member features.
             household_embed_dim (int): Embedding dimension for each household feature.
+            num_features_list (list[int]): Number of features in activity, person, and household [5, 23, 9]
         """
         super().__init__()
         self.h2 = h2
-        self.activity_embedder = MultiFeatureEmbedding(5, act_vocab_sizes, act_embed_dim, h2)
-        self.person_embedder = MultiFeatureEmbedding(26, person_vocab_sizes, person_embed_dim, h2)
-        self.household_embedder = MultiFeatureEmbedding(9, household_vocab_sizes, household_embed_dim, h2)
+        self.activity_embedder = MultiFeatureEmbedding(num_features_list[0], act_vocab_sizes, act_embed_dim, h2)
+        self.person_embedder = MultiFeatureEmbedding(num_features_list[1], person_vocab_sizes, person_embed_dim, h2)
+        self.household_embedder = MultiFeatureEmbedding(num_features_list[2], household_vocab_sizes, household_embed_dim, h2)
         self.sep_token = nn.Parameter(torch.randn(1, 1, h2))
 
     def forward(self, activity_chain: torch.Tensor, target_person: torch.Tensor, household_members: torch.Tensor) -> torch.Tensor:
@@ -121,7 +122,8 @@ class ActivityTransformerEncoder(nn.Module):
         """
         super().__init__()
         self.d_model = h2
-        self.embedding_layer = CombinedInputEmbedding(h2, act_vocab_sizes, act_embed_dim, person_vocab_sizes, person_embed_dim, household_vocab_sizes, household_embed_dim)
+        num_features_list = [len(act_vocab_sizes), len(person_vocab_sizes), len(household_vocab_sizes)]
+        self.embedding_layer = CombinedInputEmbedding(h2, act_vocab_sizes, act_embed_dim, person_vocab_sizes, person_embed_dim, household_vocab_sizes, household_embed_dim, num_features_list)
         self.pos_encoder = PositionalEncoding(h2, dropout)
         encoder_layers = nn.TransformerEncoderLayer(d_model=h2, nhead=nhead, dim_feedforward=d_hid, dropout=dropout, batch_first=False)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=nlayers)
@@ -151,6 +153,13 @@ class ActivityTransformerEncoder(nn.Module):
         device = embedded_input.device
         src_mask = self._generate_causal_mask(seq_len, self.fixed_seq_len).to(device)
         src_key_padding_mask = None
+
+        # activity_chain: [seq_len, batch_size, num_features]
+        # create sequence padding mask
+        pad_idx = 0
+        # [seq_len, batch_size] -> [batch_size, seq_len]
+        src_key_padding_mask = (activity_chain[:,:,0] == pad_idx).transpose(0, 1)
+
         if household_padding_mask is not None:
             person_mask = torch.zeros((batch_size, 1), dtype=torch.bool, device=device)
             h_mask = household_padding_mask.unsqueeze(2).expand(-1, -1, 2).reshape(batch_size, -1)
@@ -188,7 +197,7 @@ class ActivityTransformerDecoder(nn.Module):
     def _generate_causal_mask(self, sz: int, device: torch.device) -> torch.Tensor:
         return torch.triu(torch.full((sz, sz), float('-inf'), device=device), diagonal=1)
 
-    def forward(self, tgt_activity: torch.Tensor, memory: torch.Tensor, memory_key_padding_mask: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, tgt_activity: torch.Tensor, memory: torch.Tensor,memory_key_padding_mask: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass for the Transformer Decoder.
         Args:
@@ -204,8 +213,18 @@ class ActivityTransformerDecoder(nn.Module):
         device = tgt_embedded.device
         tgt_mask = self._generate_causal_mask(tgt_len, device)
         pos_encoded_tgt = self.pos_encoder(tgt_embedded * math.sqrt(self.d_model))
-        output = self.transformer_decoder(pos_encoded_tgt, memory, tgt_mask=tgt_mask, memory_key_padding_mask=memory_key_padding_mask)
-        
+        # output = self.transformer_decoder(pos_encoded_tgt, memory, tgt_mask=tgt_mask, memory_key_padding_mask=memory_key_padding_mask)
+        pad_idx = 0
+        tgt_key_padding_mask = (tgt_activity[:,:,0] == pad_idx).transpose(0, 1)
+
+        output = self.transformer_decoder(
+            pos_encoded_tgt,
+            memory,
+            tgt_mask=tgt_mask,
+            tgt_key_padding_mask=tgt_key_padding_mask,
+            memory_key_padding_mask=memory_key_padding_mask
+        )
+
         type_logits = self.type_predictor(output)
         start_time_logits = self.start_time_predictor(output)
         end_time_logits = self.end_time_predictor(output)

@@ -41,9 +41,10 @@ def train_model(model,
     """
     if loss_weights is None:
         loss_weights = {'L_CE': 1.0, 'L_s': 1.0, 'L_e': 1.0, 'L_o': 1.0, 'L_seq': 1.0}
-
+    pad_idx = 0
+    
     # 손실 함수 정의
-    type_criterion = nn.CrossEntropyLoss(reduction='none')
+    type_criterion = nn.CrossEntropyLoss(reduction='none', ignore_index=pad_idx)
 
     # Optimizer & Scheduler
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -71,7 +72,7 @@ def train_model(model,
             end_labels_seq = activity_chain[:, :, 2].long()
 
             # Teacher Forcing Input
-            tgt_activity = activity_chain[:, :-1, :].permute(1, 0, 2).long().to(device)
+            tgt_activity = activity_chain[:, :-1, :3].permute(1, 0, 2).long().to(device)
 
             # 순전파
             optimizer.zero_grad()
@@ -92,7 +93,7 @@ def train_model(model,
             # 1) CrossEntropy for Activity Type
             type_logits_flat  = type_logits.view(-1, C_type)
             type_targets_flat = type_labels_seq[:, 1:].reshape(-1)  # 디코더 예측 스텝에 맞춰 시프트
-            ce_losses = type_criterion(type_logits_flat, type_targets_flat, reduction='none')
+            ce_losses = type_criterion(type_logits_flat, type_targets_flat)
 
             # 2) Soft-label Losses for Start/End
             P_start = F.log_softmax(start_logits.view(-1, C_time), dim=1)
@@ -140,8 +141,9 @@ def train_model(model,
             for batch in val_loader:
                 # 입력 및 타겟 분리
                 activity_chain = batch['activity_chain'].to(device)
-                target_features = batch['target_features'].to(device)
-                household_members = batch['household_members'].to(device)
+                src_activity = activity_chain.permute(1, 0, 2)
+                target_features = batch['target_features'].to(device).permute(1, 0, 2)
+                household_members = batch['household_members'].to(device).permute(1, 0, 2)
                 household_mask = batch['household_mask'].to(device)
 
                 # Extract labels
@@ -150,7 +152,7 @@ def train_model(model,
                 end_labels_seq = activity_chain[:, :, 2].long()
 
                 # Teacher Forcing Input
-                tgt_activity = activity_chain[:, :-1, :].permute(1, 0, 2).long().to(device)
+                tgt_activity = activity_chain[:, :-1, :3].permute(1, 0, 2).long().to(device)
 
                 # 순전파
                 optimizer.zero_grad()
@@ -160,7 +162,7 @@ def train_model(model,
                 C_time = start_logits.shape[-1]
 
                 # Masking
-                tgt_len = activity_chain[:, 0, 3].long()
+                tgt_len = activity_chain[:, 0, 3].long() + 1
                 T_max = activity_chain.size(1)
 
                 idx = torch.arange(T_max - 1, device=device).unsqueeze(0)
@@ -171,7 +173,7 @@ def train_model(model,
                 # 1) CrossEntropy for Activity Type
                 type_logits_flat  = type_logits.view(-1, C_type)
                 type_targets_flat = type_labels_seq[:, 1:].reshape(-1)  # 디코더 예측 스텝에 맞춰 시프트
-                ce_losses = type_criterion(type_logits_flat, type_targets_flat, reduction='none')
+                ce_losses = type_criterion(type_logits_flat, type_targets_flat)
 
                 # 2) Soft-label Losses for Start/End
                 P_start = F.log_softmax(start_logits.view(-1, C_time), dim=1)
@@ -225,6 +227,75 @@ def train_model(model,
     model.load_state_dict(torch.load('best_model.pt'))
     return model
 
+def predict_sequence(model, src_activity, person_info, household_info, household_padding_mask, device, max_len=15):
+    """
+    Performs autoregressive inference to generate an activity chain.
+    Args:
+        model: The trained FullActivityTransformer model.
+        src_activity (torch.Tensor): Source activity chain. Shape (t, 1, 5).
+        person_info (torch.Tensor): Target person info. Shape (1, 1, 26).
+        household_info (torch.Tensor): Household members info. Shape (4, 1, 9).
+           household_padding_mask (torch.Tensor): Padding mask. Shape (1, 4).
+           device: The torch device.
+           max_len (int): The maximum length of the sequence to generate.
+
+       Returns:
+           torch.Tensor: The generated 3-feature (type, start, end) activity sequence.
+       """
+    model.eval()
+
+    with torch.no_grad():
+        # 1. Encode the source inputs once
+        memory = model.encoder(src_activity, person_info, household_info, household_padding_mask)
+
+        # The memory padding mask needs to be constructed just like in the training forward pass
+        batch_size = src_activity.size(1)
+        person_mask = torch.zeros((batch_size, 1), dtype=torch.bool, device=device)
+        h_mask = household_padding_mask.unsqueeze(2).expand(-1, -1, 2).reshape(batch_size, -1)
+        activity_len = src_activity.size(0)
+        final_sep_and_activity_mask = torch.zeros((batch_size, 1 + activity_len), dtype=torch.bool, device=device)
+        full_padding_mask = torch.cat([person_mask, h_mask, final_sep_and_activity_mask], dim=1)
+
+        # 2. Start with a <SOS> token. Let's assume the <SOS> token is represented by index 0 for all 3 features.
+        # Shape: [sequence_len, batch_size, num_features] -> [1, 1, 3]
+        decoder_input = torch.zeros((1, 1, 3), dtype=torch.long, device=device)
+
+        # 3. Autoregressive loop
+        generated_sequence = []
+        for _ in range(max_len):
+            # Get predictions from the decoder
+            type_logits, start_logits, end_logits = model.decoder(
+                decoder_input, memory, memory_key_padding_mask=full_padding_mask
+            )
+
+            # Focus only on the last token in the sequence for the next prediction
+            # Shape of logits: [current_seq_len, batch_size, vocab_size]
+            last_type_logits = type_logits[-1, :, :]
+            last_start_logits = start_logits[-1, :, :]
+            last_end_logits = end_logits[-1, :, :]
+
+            # Get the predicted token indices (greedy decoding)
+            predicted_type = torch.argmax(last_type_logits, dim=-1).unsqueeze(0)
+            predicted_start = torch.argmax(last_start_logits, dim=-1).unsqueeze(0)
+            predicted_end = torch.argmax(last_end_logits, dim=-1).unsqueeze(0)
+
+            # Combine the predictions into a single 3-feature token
+            # Shape: [1, 1, 3]
+            next_token = torch.cat([predicted_type, predicted_start, predicted_end], dim=-1).unsqueeze(0)
+
+            # Append the new token to the decoder input for the next iteration
+            decoder_input = torch.cat([decoder_input, next_token], dim=0)
+
+            # Store the predicted token (without the batch dimension)
+            generated_sequence.append(next_token.squeeze(1))
+
+            # Optional: Add a stopping condition if the model predicts an <EOS> token
+            # if predicted_type.item() == EOS_TOKEN_IDX:
+            #     break
+
+    # Combine all generated tokens into a final tensor
+    # Shape: [max_len, 1, 3]
+    return torch.cat(generated_sequence, dim=0)
 
 if __name__ == "__main__":
     # 예시: 데이터 로더, 모델, 디바이스 설정 후 학습 호출
@@ -257,7 +328,9 @@ if __name__ == "__main__":
 
     ACTIVITY_CHAIN_VOCAB = [] # [type=15+1, start=96, end=96, len=14, duration=96]
     for i in range(activity_chains.shape[-1]):
-        ACTIVITY_CHAIN_VOCAB.append(activity_chains[:,:,i].max())
+        ACTIVITY_CHAIN_VOCAB.append(activity_chains[:,:,i].max()+1)
+
+    TGT_ACTIVITY_CHAIN_VOCAB = ACTIVITY_CHAIN_VOCAB[:3]
 
     total_size = len(full_dataset)
     indices = np.arange(total_size)
@@ -285,7 +358,7 @@ if __name__ == "__main__":
                                 person_embed=1,
                                 household_vocab=HOUSEHOLD_VOACB,
                                 household_embed=1,
-                                tgt_act_vocab=ACTIVITY_CHAIN_VOCAB,
+                                tgt_act_vocab=TGT_ACTIVITY_CHAIN_VOCAB,
                                 tgt_act_embed=1,
                                 dropout=0.1
     )
@@ -298,9 +371,9 @@ if __name__ == "__main__":
         'L_o': 0.5, 
         'L_seq': 0.5
     }
-    train_model(model=FullActivityTransformer,
+    train_model(model=model,
                 train_loader=train_loader,
-                val_loaer = val_loader,
+                val_loader = val_loader,
                 device=device,
                 num_epochs=150,
                 lr=0.005,

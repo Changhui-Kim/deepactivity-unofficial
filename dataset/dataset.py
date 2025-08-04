@@ -58,7 +58,7 @@ class ActivityDataset(Dataset):
                     continue
                 try:
                     member_row = self.all_person_df.loc[(houseid, member_personid)]
-                    feat = torch.tensor(member_row[self.hh_members_features].values, dtype=torch.float)
+                    feat = torch.tensor(member_row[self.hh_members_features].values, dtype=torch.long)
                     members.append(feat)
                 except KeyError:
                     # This member is in the household but not in the main dataframe, which is strange
@@ -68,7 +68,7 @@ class ActivityDataset(Dataset):
         max_members = 4
         num_members = len(members)
         if num_members < max_members:
-            pad_tensor = torch.zeros((max_members - num_members, len(self.hh_members_features)), dtype=torch.float)
+            pad_tensor = torch.zeros((max_members - num_members, len(self.hh_members_features)), dtype=torch.long)
             members = members + [pad_tensor[i] for i in range(pad_tensor.shape[0])]
         elif num_members > max_members:
             # Already preprocessed.. but just in case

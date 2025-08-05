@@ -61,9 +61,9 @@ def train_model(model,
         for batch in train_loader:
             # 입력 및 타겟 분리
             activity_chain = batch['activity_chain'].to(device)
-            src_activity = activity_chain.permute(1, 0, 2)
-            target_features = batch['target_features'].to(device).permute(1, 0, 2)
-            household_members = batch['household_members'].to(device).permute(1, 0, 2)
+            src_activity = activity_chain.permute(1, 0, 2).long()
+            target_features = batch['target_features'].to(device).permute(1, 0, 2).long()
+            household_members = batch['household_members'].to(device).permute(1, 0, 2).long()
             household_mask = batch['household_mask'].to(device)
 
             # Extract labels
@@ -72,7 +72,7 @@ def train_model(model,
             end_labels_seq = activity_chain[:, :, 2].long()
 
             # Teacher Forcing Input
-            tgt_activity = activity_chain[:, :-1, :3].permute(1, 0, 2).long().to(device)
+            tgt_activity = activity_chain[:, :-1, :3].permute(1, 0, 2).long()
 
             # 순전파
             optimizer.zero_grad()
@@ -82,11 +82,10 @@ def train_model(model,
             C_time = start_logits.shape[-1]
 
             # Masking
-            tgt_len = activity_chain[:, 0, 3].long() + 1
+            tgt_len = (activity_chain[:, 0, 3].long() + 1).to(device)
             T_max = activity_chain.size(1)
-
             idx = torch.arange(T_max - 1, device=device).unsqueeze(0)
-            tgt_mask = idx < tgt_len
+            tgt_mask = idx < tgt_len.unsqueeze(1)
 
             mask_flat = tgt_mask.transpose(0, 1).reshape(-1).float()
 
@@ -99,8 +98,8 @@ def train_model(model,
             P_start = F.log_softmax(start_logits.view(-1, C_time), dim=1)
             P_end = F.log_softmax(end_logits.view(-1, C_time), dim=1)
 
-            SLM_start = create_soft_label_matrix(start_labels_seq[:, 1:].reshape(-1))
-            SLM_end = create_soft_label_matrix(end_labels_seq[:, 1:].reshape(-1))
+            SLM_start = create_soft_label_matrix(start_labels_seq[:, 1:].reshape(-1).to(device))
+            SLM_end = create_soft_label_matrix(end_labels_seq[:, 1:].reshape(-1).to(device))
 
             soft_losses_start = -(SLM_start * P_start).sum(dim=1)   # [(T-1)*B]
             soft_losses_end = -(SLM_end * P_end).sum(dim=1)
@@ -141,9 +140,9 @@ def train_model(model,
             for batch in val_loader:
                 # 입력 및 타겟 분리
                 activity_chain = batch['activity_chain'].to(device)
-                src_activity = activity_chain.permute(1, 0, 2)
-                target_features = batch['target_features'].to(device).permute(1, 0, 2)
-                household_members = batch['household_members'].to(device).permute(1, 0, 2)
+                src_activity = activity_chain.permute(1, 0, 2).long()
+                target_features = batch['target_features'].to(device).permute(1, 0, 2).long()
+                household_members = batch['household_members'].to(device).permute(1, 0, 2).long()
                 household_mask = batch['household_mask'].to(device)
 
                 # Extract labels
@@ -152,21 +151,21 @@ def train_model(model,
                 end_labels_seq = activity_chain[:, :, 2].long()
 
                 # Teacher Forcing Input
-                tgt_activity = activity_chain[:, :-1, :3].permute(1, 0, 2).long().to(device)
+                tgt_activity = activity_chain[:, :-1, :3].permute(1, 0, 2).long()
 
                 # 순전파
                 optimizer.zero_grad()
-                type_logits, start_logits, end_logits = model(activity_chain, target_features, household_members, tgt_activity, household_mask)
+                type_logits, start_logits, end_logits = model(src_activity, target_features, household_members, tgt_activity, household_mask)
                 
                 T, B, C_type = type_logits.shape
                 C_time = start_logits.shape[-1]
 
                 # Masking
-                tgt_len = activity_chain[:, 0, 3].long() + 1
+                tgt_len = (activity_chain[:, 0, 3].long() + 1).to(device)
                 T_max = activity_chain.size(1)
 
                 idx = torch.arange(T_max - 1, device=device).unsqueeze(0)
-                tgt_mask = idx < tgt_len
+                tgt_mask = idx < tgt_len.unsqueeze(1)
 
                 mask_flat = tgt_mask.transpose(0, 1).reshape(-1).float()
 
@@ -254,7 +253,7 @@ def predict_sequence(model, src_activity, person_info, household_info, household
         h_mask = household_padding_mask.unsqueeze(2).expand(-1, -1, 2).reshape(batch_size, -1)
         activity_len = src_activity.size(0)
         final_sep_and_activity_mask = torch.zeros((batch_size, 1 + activity_len), dtype=torch.bool, device=device)
-        full_padding_mask = torch.cat([person_mask, h_mask, final_sep_and_activity_mask], dim=1)
+        full_padding_mask = torch.cat([person_mask, h_mask, final_sep_and_activity_mask], dim=1).to(device)
 
         # 2. Start with a <SOS> token. Let's assume the <SOS> token is represented by index 0 for all 3 features.
         # Shape: [sequence_len, batch_size, num_features] -> [1, 1, 3]
@@ -281,7 +280,7 @@ def predict_sequence(model, src_activity, person_info, household_info, household
 
             # Combine the predictions into a single 3-feature token
             # Shape: [1, 1, 3]
-            next_token = torch.cat([predicted_type, predicted_start, predicted_end], dim=-1).unsqueeze(0)
+            next_token = torch.cat([predicted_type, predicted_start, predicted_end], dim=-1, device=device).unsqueeze(0).to(device)
 
             # Append the new token to the decoder input for the next iteration
             decoder_input = torch.cat([decoder_input, next_token], dim=0)
@@ -347,21 +346,22 @@ if __name__ == "__main__":
     val_loader = DataLoader(val_set, batch_size=64, shuffle=False)
     test_loader = DataLoader(test_set, batch_size=64, shuffle=False)
     
-    model = FullActivityTransformer(h2=4,
+    model = FullActivityTransformer(h2=6,
                                 nhead=3,
                                 enc_layers=4,
                                 dec_layers=4,
                                 d_hid = 2,
                                 src_act_vocab=ACTIVITY_CHAIN_VOCAB,
-                                src_act_embed=10,
+                                src_act_embed=6,
                                 person_vocab=PERSON_VOCAB,
-                                person_embed=1,
+                                person_embed=6,
                                 household_vocab=HOUSEHOLD_VOACB,
-                                household_embed=1,
+                                household_embed=6,
                                 tgt_act_vocab=TGT_ACTIVITY_CHAIN_VOCAB,
-                                tgt_act_embed=1,
+                                tgt_act_embed=6,
                                 dropout=0.1
     )
+    model.to(device)
 
     # Define loss weights
     loss_weights = {

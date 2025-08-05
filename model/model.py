@@ -277,6 +277,6 @@ class FullActivityTransformer(nn.Module):
             h_mask = household_padding_mask.unsqueeze(2).expand(-1, -1, 2).reshape(batch_size, -1)
             activity_len = src_activity.size(0)
             final_sep_and_activity_mask = torch.zeros((batch_size, 1 + activity_len), dtype=torch.bool, device=device)
-            full_padding_mask = torch.cat([person_mask, h_mask, final_sep_and_activity_mask], dim=1)
+            full_padding_mask = torch.cat([person_mask, h_mask, final_sep_and_activity_mask], dim=1).to(device)
 
         return self.decoder(tgt_activity, memory, memory_key_padding_mask=full_padding_mask)

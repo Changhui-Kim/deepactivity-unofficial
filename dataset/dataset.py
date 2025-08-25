@@ -74,7 +74,7 @@ class ActivityDataset(Dataset):
             # Already preprocessed.. but just in case
             members = members[:max_members]
         members_tensor = torch.stack(members)
-        members_mask = torch.tensor([1]*min(num_members, max_members) + [0]*(max_members-num_members), dtype=torch.bool)
+        members_mask = torch.tensor([False]*min(num_members, max_members) + [True]*(max_members-num_members), dtype=torch.bool)
         
 
         return {

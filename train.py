@@ -178,8 +178,8 @@ def train_model(model,
                 P_start = F.log_softmax(start_logits.view(-1, C_time), dim=1)
                 P_end = F.log_softmax(end_logits.view(-1, C_time), dim=1)
 
-                SLM_start = create_soft_label_matrix(start_labels_seq[:, 1:].reshape(-1))
-                SLM_end = create_soft_label_matrix(end_labels_seq[:, 1:].reshape(-1))
+                SLM_start = create_soft_label_matrix(start_labels_seq[:, 1:].reshape(-1).to(device))
+                SLM_end = create_soft_label_matrix(end_labels_seq[:, 1:].reshape(-1).to(device))
 
                 soft_losses_start = -(SLM_start * P_start).sum(dim=1)   # [(T-1)*B]
                 soft_losses_end = -(SLM_end * P_end).sum(dim=1)
@@ -280,7 +280,8 @@ def predict_sequence(model, src_activity, person_info, household_info, household
 
             # Combine the predictions into a single 3-feature token
             # Shape: [1, 1, 3]
-            next_token = torch.cat([predicted_type, predicted_start, predicted_end], dim=-1, device=device).unsqueeze(0).to(device)
+            next_token = torch.stack([predicted_type, predicted_start, predicted_end], dim=-1)
+            
 
             # Append the new token to the decoder input for the next iteration
             decoder_input = torch.cat([decoder_input, next_token], dim=0)
@@ -318,12 +319,12 @@ if __name__ == "__main__":
     PERSON_VOCAB = []
     for col in all_person_df.columns:
         if col not in ['HOUSEID', 'PERSONID']:
-            PERSON_VOCAB.append(len(all_person_df[col].unique()))
+            PERSON_VOCAB.append(len(all_person_df[col].unique())+1)
 
     # Get vocab size of household member info
     HOUSEHOLD_VOACB = []
     for col in full_dataset.hh_members_features:
-        HOUSEHOLD_VOACB.append(len(all_person_df[col].unique()))
+        HOUSEHOLD_VOACB.append(len(all_person_df[col].unique())+1)
 
     ACTIVITY_CHAIN_VOCAB = [] # [type=15+2, start=96, end=96, len=14, duration=96]
     for i in range(activity_chains.shape[-1]):

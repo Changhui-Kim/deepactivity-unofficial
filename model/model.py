@@ -100,20 +100,18 @@ class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
         super().__init__()
         self.dropout = nn.Dropout(p=dropout)
-        position = torch.arange(max_len).unsqueeze(1)                                       # [T, 1]
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)              # [T, 1]
         div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        pe = torch.zeros(max_len, 1, d_model)                                               # [T, d_model]
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe)                                                      # [T, d_model]
+        pe = torch.zeros(max_len, d_model)                                               # [T, d_model]
+        pe[:, 0::2] = torch.sin(position * div_term)    # even dims
+        pe[:, 1::2] = torch.cos(position * div_term)    # odd dims
+        pe = pe.unsqueeze(0)    # [1, T, d_model]
+        self.register_buffer('pe', pe)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: Tensor, shape [seq_len, batch_size, embedding_dim]
-        """
+        # x: [B, T, d_model]
         T = x.size(1)
-        x = x + self.pe[:T].unsqueeze(0)        # [1, T, d_model] broadcast over batch
+        x = x + self.pe[:, :T, :]
         return self.dropout(x)
 
 class ActivityTransformerEncoder(nn.Module):
@@ -197,7 +195,7 @@ class ActivityTransformerDecoder(nn.Module):
                  nhead: int, nlayers: int, d_hid: int, dropout: float = 0.1):
         super().__init__()
         self.d_model = h2
-        self.tgt_act_embedding = MultiFeatureEmbedding(num_features=3, vocab_sizes=tgt_act_vocab_sizes, embed_dim=tgt_act_embed_dim, output_dim=h2)
+        self.tgt_embed = MultiFeatureEmbedding(num_features=3, vocab_sizes=tgt_act_vocab_sizes, embed_dim=tgt_act_embed_dim, output_dim=h2)
         self.pos_encoder = PositionalEncoding(h2, dropout)
         dec_layer = nn.TransformerDecoderLayer(d_model=h2, nhead=nhead, dim_feedforward=d_hid, dropout=dropout, batch_first=True)
         self.transformer_decoder = nn.TransformerDecoder(dec_layer, num_layers=nlayers)

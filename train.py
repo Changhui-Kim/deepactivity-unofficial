@@ -117,7 +117,7 @@ def train_model(model,
             preds_end   = end_logits.argmax(dim=-1)         # [B, T-1]
 
             # L_seq: penalizes start_time > end_time
-            dur_violation = torch.relu(preds_start_bf.float() - preds_end_bf.float())
+            dur_violation = torch.relu(preds_start.float() - preds_end.float())
             L_seq = dur_violation.masked_select(tgt_mask).mean()
 
             # L_o: penalizes overlap between consecutive activities
@@ -340,10 +340,10 @@ if __name__ == "__main__":
     val_loader   = DataLoader(val_set,   batch_size=64, shuffle=False)
     test_loader  = DataLoader(test_set,  batch_size=64, shuffle=False)
     
-    model = FullActivityTransformer(h2=6,
-                                nhead=3,
-                                enc_layers=4,
-                                dec_layers=4,
+    model = FullActivityTransformer(h2=64,
+                                nhead=8,
+                                enc_layers=2,
+                                dec_layers=2,
                                 d_hid = 2,
                                 src_act_vocab=ACTIVITY_CHAIN_VOCAB,
                                 src_act_embed=6,
@@ -364,7 +364,7 @@ if __name__ == "__main__":
         'L_o': 0.5, 
         'L_seq': 0.5
     }
-    
+
     train_model(model=model,
                 train_loader=train_loader,
                 val_loader = val_loader,

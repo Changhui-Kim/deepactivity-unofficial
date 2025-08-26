@@ -36,6 +36,7 @@ class ActivityDataset(Dataset):
         return len(self.activity_chains)
 
     def __getitem__(self, idx):
+        # Single sample: [T, F] -> when batched by DataLoader -> [B, T, F]
         chain = torch.tensor(self.activity_chains[idx], dtype=torch.long)
 
         # Get the correct HOUSEID and PERSONID from the person_ids_df
@@ -46,6 +47,7 @@ class ActivityDataset(Dataset):
         try:
             # Retrieve target person's features using the multi-index
             person_row = self.all_person_df.loc[(houseid, personid)]
+            # keep [1, D] so batch gives [B, 1, D]
             target_features = torch.tensor(person_row[self.full_features].values, dtype=torch.long).unsqueeze(0)
         except KeyError:
             raise IndexError(f"Person with HOUSEID={houseid}, PERSONID={personid} not found in all_person_df.")
@@ -78,8 +80,8 @@ class ActivityDataset(Dataset):
         
 
         return {
-            'activity_chain': chain,                # [15, 5]
-            'target_features': target_features,     # [1, 23]
+            'activity_chain': chain,                # [T, F] ([15, 5])
+            'target_features': target_features,     # [1, D] ([1, 23])
             'household_members': members_tensor,    # [4, 9]
             'household_mask': members_mask,         # [4]
         }

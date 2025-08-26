@@ -5,29 +5,85 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, WeightedRandomSampler
+import os
+from torch import amp
+torch.set_float32_matmul_precision("high")
 
 EOS_TOKEN_IDX = 17
 
-def create_soft_label_matrix(original_labels, num_classes=96, n_s=5, w_m=1.0, w_s=0.1):
+def create_soft_label_matrix(labels: torch.Tensor,
+                             num_classes: int,
+                             n_s: int = 5,
+                             w_m: float = 1.0,
+                             w_s: float = 0.1,
+                             return_reshaped: bool = False):
     """
-    original_labels: [N] LongTensor of class indices
-    returns: [N, num_classes] soft label distributions
+    Vectorized soft label builder.
+
+    labels: Long tensor of class ids. Shape can be arbitrary (e.g. [B, T-1] or [N]).
+    num_classes: int, number of classes (e.g., C_time).
+    n_s: radius for side neighbors.
+    w_m: weight for the main (true) class.
+    w_s: weight for each side neighbor.
+    return_reshaped: if True, returns [..., num_classes] matching labels' original shape.
+                     if False, returns [N, num_classes] flattened (useful for matmul with logits).
+
+    Returns:
+      soft: Tensor of shape [N, C] if return_reshaped=False,
+            else shape [..., C] (same leading dims as labels).
     """
-    B = original_labels.size(0)
-    soft_labels = torch.zeros((B, num_classes), device=original_labels.device)
+    # ---- sanitize inputs ----
+    if labels.dtype != torch.long:
+        labels = labels.long()
+    device = labels.device
+    orig_shape = labels.shape
+    labels_flat = labels.reshape(-1)                  # [N]
+    N = labels_flat.numel()
+    C = int(num_classes)
 
-    for i in range(B):
-        true_idx = int(original_labels[i].item())
-        soft_labels[i, true_idx] = w_m
-        for offset in range(1, n_s + 1):
-            if true_idx - offset >= 0:
-                soft_labels[i, true_idx - offset] = w_s
-            if true_idx + offset < num_classes:
-                soft_labels[i, true_idx + offset] = w_s
+    # offsets and weights
+    offsets = torch.arange(-n_s, n_s + 1, device=device)             # [K], K=2*n_s+1
+    K = offsets.numel()
+    weights = torch.full((K,), w_s, device=device)
+    weights[n_s] = w_m                                              # center
 
-    # Normalize row to sum to 1
-    soft_labels = soft_labels / torch.clamp(soft_labels.sum(dim=1, keepdim=True), min=1e-9)
-    return soft_labels
+    # indices per sample for scatter_add
+    idx = (labels_flat.unsqueeze(1) + offsets.unsqueeze(0))          # [N, K]
+    idx.clamp_(0, C - 1)
+
+    # build soft matrix
+    soft = torch.zeros(N, C, device=device, dtype=torch.float32)     # [N, C]
+    soft.scatter_add_(1, idx, weights.expand(N, K))                  # add neighbor weights
+
+    # normalize rows to 1 (avoid divide-by-zero)
+    row_sum = soft.sum(dim=1, keepdim=True).clamp_min_(1e-9)
+    soft = soft / row_sum
+
+    if return_reshaped:
+        soft = soft.view(*orig_shape, C)                             # [..., C]
+    return soft
+
+
+# def create_soft_label_matrix(original_labels, num_classes=96, n_s=5, w_m=1.0, w_s=0.1):
+#     """
+#     original_labels: [N] LongTensor of class indices
+#     returns: [N, num_classes] soft label distributions
+#     """
+#     B = original_labels.size(0)
+#     soft_labels = torch.zeros((B, num_classes), device=original_labels.device)
+
+#     for i in range(B):
+#         true_idx = int(original_labels[i].item())
+#         soft_labels[i, true_idx] = w_m
+#         for offset in range(1, n_s + 1):
+#             if true_idx - offset >= 0:
+#                 soft_labels[i, true_idx - offset] = w_s
+#             if true_idx + offset < num_classes:
+#                 soft_labels[i, true_idx + offset] = w_s
+
+#     # Normalize row to sum to 1
+#     soft_labels = soft_labels / torch.clamp(soft_labels.sum(dim=1, keepdim=True), min=1e-9)
+#     return soft_labels
 
 def train_model(model,
                 train_loader: DataLoader,
@@ -45,6 +101,7 @@ def train_model(model,
     """
     Batch-first training loop (no permutes)
     """
+    scaler = amp.GradScaler(enabled=(device.type=="cuda"))
     if loss_weights is None:
         loss_weights = {'L_CE': 1.0, 'L_s': 1.0, 'L_e': 1.0, 'L_o': 1.0, 'L_seq': 1.0}
     
@@ -66,10 +123,10 @@ def train_model(model,
         
         for batch in train_loader:
             # --- inputs ---
-            activity_chain      = batch['activity_chain'].to(device).long()
-            target_features     = batch['target_features'].to(device).long()
-            household_members   = batch['household_members'].to(device).long()
-            household_mask      = batch['household_mask'].to(device).bool()
+            activity_chain      = batch['activity_chain'].to(device, non_blocking=True).long()
+            target_features     = batch['target_features'].to(device, non_blocking=True).long()
+            household_members   = batch['household_members'].to(device, non_blocking=True).long()
+            household_mask      = batch['household_mask'].to(device, non_blocking=True).bool()
 
             # labels per token
             type_labels_seq     = activity_chain[..., 0].long() # [B, T]
@@ -80,75 +137,76 @@ def train_model(model,
             tgt_activity = activity_chain[:, :-1, :3].long()
 
             # 순전파
-            optimizer.zero_grad()
-            type_logits, start_logits, end_logits = model(
-                src_activity=activity_chain,            # [B, T, 5]
-                person_info=target_features,            # [B, 1, Dp]
-                household_info=household_members,       # [B, H, Dh]
-                tgt_activity=tgt_activity,              # [B, T-1, 3]
-                household_padding_mask=household_mask   # [B, H] bool
-                )   # each: [B, T-1, C]
-            
-            B, Tm1, C_type = type_logits.shape
-            C_time = start_logits.shape[-1]
+            optimizer.zero_grad(set_to_none=True)
+            with amp.autocast(device_type="cuda", dtype=torch.float16, enabled=(device.type=="cuda")):
+                type_logits, start_logits, end_logits = model(
+                    src_activity=activity_chain,            # [B, T, 5]
+                    person_info=target_features,            # [B, 1, Dp]
+                    household_info=household_members,       # [B, H, Dh]
+                    tgt_activity=tgt_activity,              # [B, T-1, 3]
+                    household_padding_mask=household_mask   # [B, H] bool
+                    )   # each: [B, T-1, C]
+                
+                B, Tm1, C_type = type_logits.shape
+                C_time = start_logits.shape[-1]
 
-            # valid token mask for targets (based on stored length at time 0, feature index 3)
-            T_max = activity_chain.size(1)
-            tgt_len = (activity_chain[:, 0, 3].long() + 1).clamp(max=T_max)     # [B]
-            idx = torch.arange(T_max - 1, device=device).unsqueeze(0)           # [1, T-1]
-            tgt_mask = (idx < tgt_len.unsqueeze(1)).to(torch.bool)              # [B, T-1] bool
-            mask_flat = tgt_mask.reshape(-1).float()            # [(B*(T-1))]
+                # valid token mask for targets (based on stored length at time 0, feature index 3)
+                T_max = activity_chain.size(1)
+                tgt_len = (activity_chain[:, 0, 3].long() + 1).clamp(max=T_max)     # [B]
+                idx = torch.arange(T_max - 1, device=device).unsqueeze(0)           # [1, T-1]
+                tgt_mask = (idx < tgt_len.unsqueeze(1)).to(torch.bool)              # [B, T-1] bool
+                mask_flat = tgt_mask.reshape(-1).float()            # [(B*(T-1))]
 
-            # 1) CrossEntropy for Activity Type
-            type_logits_flat  = type_logits.view(-1, C_type)
-            type_targets_flat = type_labels_seq[:, 1:].reshape(-1)  # 디코더 예측 스텝에 맞춰 시프트
-            ce_losses = type_criterion(type_logits_flat, type_targets_flat)
+                # 1) CrossEntropy for Activity Type
+                type_logits_flat  = type_logits.view(-1, C_type)
+                type_targets_flat = type_labels_seq[:, 1:].reshape(-1)  # 디코더 예측 스텝에 맞춰 시프트
+                ce_losses = type_criterion(type_logits_flat, type_targets_flat)
 
-            # 2) Soft-label Losses for Start/End
-            P_start = F.log_softmax(start_logits.reshape(-1, C_time),   dim=1)
-            P_end   = F.log_softmax(end_logits.reshape(-1, C_time),     dim=1)
-            SLM_start   = create_soft_label_matrix(start_labels_seq[:, 1:].reshape(-1).to(device), num_classes=C_time)
-            SLM_end     = create_soft_label_matrix(end_labels_seq[:, 1:].reshape(-1).to(device), num_classes=C_time)
-            soft_losses_start   = -(SLM_start   * P_start).sum(dim=1)   # [(T-1)*B]
-            soft_losses_end     = -(SLM_end     * P_end  ).sum(dim=1)
+                # 2) Soft-label Losses for Start/End
+                P_start = F.log_softmax(start_logits.reshape(-1, C_time),   dim=1)
+                P_end   = F.log_softmax(end_logits.reshape(-1, C_time),     dim=1)
+                SLM_start   = create_soft_label_matrix(start_labels_seq[:, 1:].reshape(-1).to(device), num_classes=C_time)
+                SLM_end     = create_soft_label_matrix(end_labels_seq[:, 1:].reshape(-1).to(device), num_classes=C_time)
+                soft_losses_start   = -(SLM_start   * P_start).sum(dim=1)   # [(T-1)*B]
+                soft_losses_end     = -(SLM_end     * P_end  ).sum(dim=1)
 
-            # 3) Temporal Order & Overlap Penalties
-            preds_start = start_logits.argmax(dim=-1)       # [B, T-1]
-            preds_end   = end_logits.argmax(dim=-1)         # [B, T-1]
+                # 3) Temporal Order & Overlap Penalties
+                preds_start = start_logits.argmax(dim=-1)       # [B, T-1]
+                preds_end   = end_logits.argmax(dim=-1)         # [B, T-1]
 
-            # L_seq: penalizes start_time > end_time
-            dur_violation = torch.relu(preds_start.float() - preds_end.float())
-            L_seq = dur_violation.masked_select(tgt_mask).mean()
+                # L_seq: penalizes start_time > end_time
+                dur_violation = torch.relu(preds_start.float() - preds_end.float())
+                L_seq = dur_violation.masked_select(tgt_mask).mean()
 
-            # L_o: penalizes overlap between consecutive activities
-            if Tm1 > 1:
-                overlap = torch.relu(preds_end[:, :-1].float() - preds_start[:, 1:].float())    # [B, T-2]
-                valid_pair_mask = tgt_mask[:, :-1] & tgt_mask[:, 1:]                            # [B, T-2]
-                L_o = overlap.masked_select(valid_pair_mask).mean()
-            else:
-                L_o = torch.tensor(0.0, device=device)
-            
-            L_CE    = (ce_losses            * mask_flat).sum() / (mask_flat.sum() + 1e-9)
-            L_s     = (soft_losses_start    * mask_flat).sum() / (mask_flat.sum() + 1e-9)
-            L_e     = (soft_losses_end      * mask_flat).sum() / (mask_flat.sum() + 1e-9)
+                # L_o: penalizes overlap between consecutive activities
+                if Tm1 > 1:
+                    overlap = torch.relu(preds_end[:, :-1].float() - preds_start[:, 1:].float())    # [B, T-2]
+                    valid_pair_mask = tgt_mask[:, :-1] & tgt_mask[:, 1:]                            # [B, T-2]
+                    L_o = overlap.masked_select(valid_pair_mask).mean()
+                else:
+                    L_o = torch.tensor(0.0, device=device)
+                
+                L_CE    = (ce_losses            * mask_flat).sum() / (mask_flat.sum() + 1e-9)
+                L_s     = (soft_losses_start    * mask_flat).sum() / (mask_flat.sum() + 1e-9)
+                L_e     = (soft_losses_end      * mask_flat).sum() / (mask_flat.sum() + 1e-9)
 
-            loss = (loss_weights['L_CE'] * L_CE +
-                    loss_weights['L_s'] * L_s +
-                    loss_weights['L_e'] * L_e +
-                    loss_weights['L_o'] * L_o +
-                    loss_weights['L_seq'] * L_seq)
+                loss = (loss_weights['L_CE'] * L_CE +
+                        loss_weights['L_s'] * L_s +
+                        loss_weights['L_e'] * L_e +
+                        loss_weights['L_o'] * L_o +
+                        loss_weights['L_seq'] * L_seq)
 
             # 역전파 및 최적화
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
-            running_loss += loss.item() * activity_chain.size(0)
+            running_loss += float(loss.detach()) * B
 
         epoch_train_loss = running_loss / len(train_loader.dataset)
         scheduler.step()
         if writer is not None:
             writer.add_scalar("Loss/train", epoch_train_loss, epoch)
-
 
         # ------------------------Validation------------------------
         model.eval()
@@ -168,60 +226,61 @@ def train_model(model,
                 tgt_activity        = activity_chain[:, :-1, :3].long()
 
                 # 순전파
-                type_logits, start_logits, end_logits = model(
-                    src_activity=activity_chain,            # [B, T, 5]
-                    person_info=target_features,            # [B, 1, Dp]
-                    household_info=household_members,       # [B, H, Dh]
-                    tgt_activity=tgt_activity,              # [B, T-1, 3]
-                    household_padding_mask=household_mask   # [B, H] bool
-                    )   # each: [B, T-1, C]
-                
-                B, Tm1, C_type = type_logits.shape
-                C_time = start_logits.shape[-1]
-                T_max = activity_chain.size(1)
-                tgt_len = (activity_chain[:, 0, 3].long() + 1).clamp(max=T_max)
-                idx = torch.arange(T_max - 1, device=device).unsqueeze(0)
-                tgt_mask = (idx < tgt_len.unsqueeze(1)).to(torch.bool)
-                mask_flat = tgt_mask.reshape(-1).float()
+                with amp.autocast(device_type="cuda", dtype=torch.float16, enabled=(device.type=="cuda")):
+                    type_logits, start_logits, end_logits = model(
+                        src_activity=activity_chain,            # [B, T, 5]
+                        person_info=target_features,            # [B, 1, Dp]
+                        household_info=household_members,       # [B, H, Dh]
+                        tgt_activity=tgt_activity,              # [B, T-1, 3]
+                        household_padding_mask=household_mask   # [B, H] bool
+                        )   # each: [B, T-1, C]
+                    
+                    B, Tm1, C_type = type_logits.shape
+                    C_time = start_logits.shape[-1]
+                    T_max = activity_chain.size(1)
+                    tgt_len = (activity_chain[:, 0, 3].long() + 1).clamp(max=T_max)
+                    idx = torch.arange(T_max - 1, device=device).unsqueeze(0)
+                    tgt_mask = (idx < tgt_len.unsqueeze(1)).to(torch.bool)
+                    mask_flat = tgt_mask.reshape(-1).float()
 
-                # 1) CrossEntropy for Activity Type
-                type_logits_flat  = type_logits.reshape(-1, C_type)
-                type_targets_flat = type_labels_seq[:, 1:].reshape(-1)  # 디코더 예측 스텝에 맞춰 시프트
-                ce_losses = type_criterion(type_logits_flat, type_targets_flat)
+                    # 1) CrossEntropy for Activity Type
+                    type_logits_flat  = type_logits.reshape(-1, C_type)
+                    type_targets_flat = type_labels_seq[:, 1:].reshape(-1)  # 디코더 예측 스텝에 맞춰 시프트
+                    ce_losses = type_criterion(type_logits_flat, type_targets_flat)
 
-                # 2) Soft-label Losses for Start/End
-                P_start = F.log_softmax(start_logits.reshape(-1, C_time), dim=1)
-                P_end   = F.log_softmax(end_logits.reshape(-1, C_time),   dim=1)
-                SLM_start   = create_soft_label_matrix(start_labels_seq[:, 1:].reshape(-1).to(device),  num_classes=C_time)
-                SLM_end     = create_soft_label_matrix(end_labels_seq[:, 1:].reshape(-1).to(device),    num_classes=C_time)
-                soft_losses_start   = -(SLM_start   * P_start).sum(dim=1)   # [(T-1)*B]
-                soft_losses_end     = -(SLM_end     * P_end  ).sum(dim=1)
+                    # 2) Soft-label Losses for Start/End
+                    P_start = F.log_softmax(start_logits.reshape(-1, C_time), dim=1)
+                    P_end   = F.log_softmax(end_logits.reshape(-1, C_time),   dim=1)
+                    SLM_start   = create_soft_label_matrix(start_labels_seq[:, 1:].reshape(-1).to(device),  num_classes=C_time)
+                    SLM_end     = create_soft_label_matrix(end_labels_seq[:, 1:].reshape(-1).to(device),    num_classes=C_time)
+                    soft_losses_start   = -(SLM_start   * P_start).sum(dim=1)   # [(T-1)*B]
+                    soft_losses_end     = -(SLM_end     * P_end  ).sum(dim=1)
 
-                # 3) Temporal Order & Overlap Penalties
-                preds_start = start_logits.argmax(dim=-1)    # [T-1, B]
-                preds_end   = end_logits.argmax(dim=-1)
-                dur_violation = torch.relu(preds_start.float() - preds_end.float())
-                L_seq = dur_violation.masked_select(tgt_mask).mean()
+                    # 3) Temporal Order & Overlap Penalties
+                    preds_start = start_logits.argmax(dim=-1)    # [T-1, B]
+                    preds_end   = end_logits.argmax(dim=-1)
+                    dur_violation = torch.relu(preds_start.float() - preds_end.float())
+                    L_seq = dur_violation.masked_select(tgt_mask).mean()
 
-                if Tm1 > 1:
-                    overlap = torch.relu(preds_end[:, :-1].float() - preds_start[:, 1:].float())    # [B, T-2]
-                    valid_pair_mask = tgt_mask[:, :-1] & tgt_mask[:, 1:]                            # [B, T-2]
-                    L_o = overlap.masked_select(valid_pair_mask).mean()
-                else:
-                    L_o = torch.tensor(0.0, device=device)
+                    if Tm1 > 1:
+                        overlap = torch.relu(preds_end[:, :-1].float() - preds_start[:, 1:].float())    # [B, T-2]
+                        valid_pair_mask = tgt_mask[:, :-1] & tgt_mask[:, 1:]                            # [B, T-2]
+                        L_o = overlap.masked_select(valid_pair_mask).mean()
+                    else:
+                        L_o = torch.tensor(0.0, device=device)
 
-                
-                L_CE    = (ce_losses            * mask_flat).sum() / (mask_flat.sum() + 1e-9)
-                L_s     = (soft_losses_start    * mask_flat).sum() / (mask_flat.sum() + 1e-9)
-                L_e     = (soft_losses_end      * mask_flat).sum() / (mask_flat.sum() + 1e-9)
+                    
+                    L_CE    = (ce_losses            * mask_flat).sum() / (mask_flat.sum() + 1e-9)
+                    L_s     = (soft_losses_start    * mask_flat).sum() / (mask_flat.sum() + 1e-9)
+                    L_e     = (soft_losses_end      * mask_flat).sum() / (mask_flat.sum() + 1e-9)
 
-                loss = (loss_weights['L_CE'] * L_CE +
-                        loss_weights['L_s'] * L_s +
-                        loss_weights['L_e'] * L_e +
-                        loss_weights['L_o'] * L_o +
-                        loss_weights['L_seq'] * L_seq)
+                    loss = (loss_weights['L_CE'] * L_CE +
+                            loss_weights['L_s'] * L_s +
+                            loss_weights['L_e'] * L_e +
+                            loss_weights['L_o'] * L_o +
+                            loss_weights['L_seq'] * L_seq)
 
-                val_running_loss += loss.item() * activity_chain.size(0)
+                val_running_loss += float(loss.detach()) * activity_chain.size(0)
 
         epoch_val_loss = val_running_loss / len(val_loader.dataset)
 
@@ -336,11 +395,12 @@ if __name__ == "__main__":
     train_weights = full_weights[train_idx]
     sampler = WeightedRandomSampler(train_weights, num_samples=len(train_weights), replacement=True)
     
-    train_loader = DataLoader(train_set, batch_size=64, shuffle=False, sampler=sampler)
-    val_loader   = DataLoader(val_set,   batch_size=64, shuffle=False)
-    test_loader  = DataLoader(test_set,  batch_size=64, shuffle=False)
+    num_workers = max(4, os.cpu_count() //2)
+    train_loader = DataLoader(train_set, batch_size=256, shuffle=False, sampler=sampler, num_workers=num_workers, pin_memory=True, persistent_workers=True, prefetch_factor=2)
+    val_loader   = DataLoader(val_set,   batch_size=256, shuffle=False, num_workers=num_workers, pin_memory=True, persistent_workers=True, prefetch_factor=2)
+    test_loader  = DataLoader(test_set,  batch_size=256, shuffle=False)
     
-    model = FullActivityTransformer(h2=64,
+    model = FullActivityTransformer(h2=128,
                                 nhead=8,
                                 enc_layers=2,
                                 dec_layers=2,

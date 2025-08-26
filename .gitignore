@@ -20,6 +20,7 @@ __pycache__/
 
 # Tensorboard
 runs/
+tb_prof/
 
 # OS-specific
 .DS_Store

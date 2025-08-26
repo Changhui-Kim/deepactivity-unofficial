@@ -144,7 +144,7 @@ class ActivityTransformerEncoder(nn.Module):
         self.pos_encoder = PositionalEncoding(h2, dropout)
         enc_layer = nn.TransformerEncoderLayer(
             d_model=h2, nhead=nhead, dim_feedforward=d_hid, 
-            dropout=dropout, batch_first=False)
+            dropout=dropout, batch_first=True)
         self.transformer_encoder = nn.TransformerEncoder(enc_layer, num_layers=nlayers)
         # Sequence Layout: Person(1) + [SEP, Member]*4 + Sep(1) + Activities(T)
         # For H=4 members, activities start at 1 + 2*4 + 1 = 10

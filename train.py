@@ -85,7 +85,7 @@ def train_model(model,
             tgt_len = (activity_chain[:, 0, 3].long() + 1).to(device)
             T_max = activity_chain.size(1)
             idx = torch.arange(T_max - 1, device=device).unsqueeze(0)
-            tgt_mask = idx < tgt_len.unsqueeze(1)
+            tgt_mask = (idx < tgt_len.unsqueeze(1)).to(torch.bool)
 
             mask_flat = tgt_mask.transpose(0, 1).reshape(-1).float()
 
@@ -98,21 +98,32 @@ def train_model(model,
             P_start = F.log_softmax(start_logits.view(-1, C_time), dim=1)
             P_end = F.log_softmax(end_logits.view(-1, C_time), dim=1)
 
-            SLM_start = create_soft_label_matrix(start_labels_seq[:, 1:].reshape(-1).to(device))
-            SLM_end = create_soft_label_matrix(end_labels_seq[:, 1:].reshape(-1).to(device))
+            SLM_start = create_soft_label_matrix(start_labels_seq[:, 1:].reshape(-1).to(device), num_classes=C_time)
+            SLM_end = create_soft_label_matrix(end_labels_seq[:, 1:].reshape(-1).to(device), num_classes=C_time)
 
             soft_losses_start = -(SLM_start * P_start).sum(dim=1)   # [(T-1)*B]
             soft_losses_end = -(SLM_end * P_end).sum(dim=1)
 
             # 3) Temporal Order & Overlap Penalties
             preds_start = start_logits.argmax(dim=2)    # [T-1, B]
+            preds_start_bf = preds_start.T
             preds_end   = end_logits.argmax(dim=2)
+            preds_end_bf = preds_end.T
+
+            dur_violation = torch.relu(preds_start_bf.float() - preds_end_bf.float())
+            mask = tgt_mask.to(torch.bool)
+            if mask.shape != dur_violation.shape:
+                mask = mask.T
+            L_seq = dur_violation.masked_select(mask).mean()
 
             # L_seq: penalizes start_time > end_time
-            L_seq = torch.relu(preds_start.float() - preds_end.float()).masked_select(tgt_mask).mean()
+            # L_seq = torch.relu(preds_start.float() - preds_end.float())
+            # L_seq = L_seq.masked_select(tgt_mask).mean()
 
             # L_o: penalizes overlap between consecutive activities
-            L_o = torch.relu(preds_end[:-1,:,:].float() - preds_start[1:,:,:].float()).masked_select(tgt_mask[:-1]).mean()
+            
+            L_o = torch.relu(preds_end[:-1,:].float() - preds_start[1:,:].float()).T
+            L_o = L_o.masked_select(tgt_mask[:, :-1]).mean()
             
             L_CE    = (ce_losses            * mask_flat).sum() / mask_flat.sum()
             L_s     = (soft_losses_start    * mask_flat).sum() / mask_flat.sum()
@@ -132,6 +143,8 @@ def train_model(model,
 
         epoch_train_loss = running_loss / len(train_loader.dataset)
         scheduler.step()
+        writer.add_scalar("Loss/train", epoch_train_loss, epoch)
+
 
         # 검증
         model.eval()
@@ -166,6 +179,7 @@ def train_model(model,
 
                 idx = torch.arange(T_max - 1, device=device).unsqueeze(0)
                 tgt_mask = idx < tgt_len.unsqueeze(1)
+                tgt_mask = tgt_mask.to(torch.bool)
 
                 mask_flat = tgt_mask.transpose(0, 1).reshape(-1).float()
 
@@ -178,8 +192,8 @@ def train_model(model,
                 P_start = F.log_softmax(start_logits.view(-1, C_time), dim=1)
                 P_end = F.log_softmax(end_logits.view(-1, C_time), dim=1)
 
-                SLM_start = create_soft_label_matrix(start_labels_seq[:, 1:].reshape(-1).to(device))
-                SLM_end = create_soft_label_matrix(end_labels_seq[:, 1:].reshape(-1).to(device))
+                SLM_start = create_soft_label_matrix(start_labels_seq[:, 1:].reshape(-1).to(device), num_classes=C_time)
+                SLM_end = create_soft_label_matrix(end_labels_seq[:, 1:].reshape(-1).to(device), num_classes=C_time)
 
                 soft_losses_start = -(SLM_start * P_start).sum(dim=1)   # [(T-1)*B]
                 soft_losses_end = -(SLM_end * P_end).sum(dim=1)
@@ -189,10 +203,21 @@ def train_model(model,
                 preds_end   = end_logits.argmax(dim=2)
 
                 # L_seq: penalizes start_time > end_time
-                L_seq = torch.relu(preds_start.float() - preds_end.float()).masked_select(tgt_mask).sum() / (tgt_mask.sum() + 1e-9)
+                preds_start = start_logits.argmax(dim=2)    # [T-1, B]
+                preds_start_bf = preds_start.T
+                preds_end   = end_logits.argmax(dim=2)
+                preds_end_bf = preds_end.T
+
+                dur_violation = torch.relu(preds_start_bf.float() - preds_end_bf.float())
+                mask = tgt_mask.to(torch.bool)
+                if mask.shape != dur_violation.shape:
+                    mask = mask.T
+                L_seq = dur_violation.masked_select(mask).mean()
+
+                # L_seq = torch.relu(preds_start.float() - preds_end.float()).masked_select(tgt_mask).sum() / (tgt_mask.sum() + 1e-9)
 
                 # L_o: penalizes overlap between consecutive activities
-                L_o = torch.relu(preds_end[:-1,:,:].float() - preds_start[1:,:,:].float()).masked_select(tgt_mask[:-1]).sum() / (tgt_mask[:-1].sum() + 1e-9)
+                L_o = torch.relu(preds_end[:-1,:].float() - preds_start[1:,:].float()).masked_select(tgt_mask[:-1]).sum() / (tgt_mask[:-1].sum() + 1e-9)
                 
                 L_CE    = (ce_losses            * mask_flat).sum() / mask_flat.sum()
                 L_s     = (soft_losses_start    * mask_flat).sum() / mask_flat.sum()
@@ -210,6 +235,7 @@ def train_model(model,
 
         print(f"Epoch {epoch}/{num_epochs} - "
               f"Train Loss: {epoch_train_loss:.4f}, Val Loss: {epoch_val_loss:.4f}")
+        writer.add_scalar("Loss/val", epoch_val_loss, epoch)
 
         # Early stopping 체크
         if epoch_val_loss < best_val_loss:
@@ -303,6 +329,8 @@ if __name__ == "__main__":
     from dataset.dataset import ActivityDataset
     from torch.utils.data import DataLoader, Dataset, Subset, WeightedRandomSampler
     from sklearn.model_selection import train_test_split
+    from torch.utils.tensorboard import SummaryWriter
+    writer = SummaryWriter()
     PERSONS_PATH = "C:/Users/user/PTV_Intern/src/DeepAM/dataset/persons_info.csv"
     CHAIN_PATH = "C:/Users/user/PTV_Intern/src/DeepAM/dataset/activity_chain.npy"
     IDS_PATH = "C:/Users/user/PTV_Intern/src/DeepAM/dataset/person_ids.csv"

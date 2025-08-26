@@ -195,7 +195,7 @@ class ActivityTransformerDecoder(nn.Module):
         self.end_time_predictor = nn.Linear(h2, tgt_act_vocab_sizes[2])
 
     def _generate_causal_mask(self, sz: int, device: torch.device) -> torch.Tensor:
-        return torch.triu(torch.full((sz, sz), float('-inf'), device=device), diagonal=1)
+        return torch.triu(torch.ones((sz, sz), dtype=torch.bool, device=device), diagonal=1)
 
     def forward(self, tgt_activity: torch.Tensor, memory: torch.Tensor,memory_key_padding_mask: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """

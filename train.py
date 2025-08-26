@@ -447,9 +447,8 @@ if __name__ == "__main__":
                 weight_decay=0.00001,
                 scheduler_step=5,
                 scheduler_gamma=0.5,
-                early_stopping_patience=5,
+                early_stopping_patience=10,
                 loss_weights=loss_weights,
                 writer=writer
                 )
 
-    
